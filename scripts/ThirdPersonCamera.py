@@ -14,7 +14,7 @@ class ThirdPersonCamera(types.KX_PythonComponent):
         ("Camera Crab (Side)", 0.6),            # Lateral offset
         ("Camera Collision", True),             # Enable collision detection
         ("Camera Collision Property", "ground"),# Collision property
-        ("Align Player to View", "On Player Movement"), # Player alignment mode
+        ("Align Player to View", {"Never", "On Player Movement", "Always"}), # Player alignment mode
         ("Align Player Smooth", 0.7),           # Player rotation smoothing
         ("Rotation Smooth", 0.05),              # Camera rotation smoothing
         ("Position Smooth", 0.3),               # Camera position smoothing
