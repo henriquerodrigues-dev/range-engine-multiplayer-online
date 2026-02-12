@@ -2,57 +2,12 @@
 ====================================================
 CharacterController – Locomotion & Animation States
 ====================================================
-
-OBJECT VARIABLES (accessible by other scripts):
------------------------------------------------
-object["state"]  -> Estado atual do player (string)
-    idle
-    walking_front
-    walking_back
-    walking_strafe_left
-    walking_strafe_right
-    running_front
-    running_back
-    running_strafe_left
-    running_strafe_right
-    jump_idle
-    jump_move
-    fall_idle
-    fall_move
-
-object["speed"]  -> Velocidade normalizada (0.0 – 1.0)
-
-CONFIGURABLE ARGUMENTS (Inspector):
-----------------------------------
-Activate
-Walk Speed
-Run Speed
-Max Jumps
-Avoid Sliding
-Static Jump Direction
-Static Jump Rotation
-Smooth Character Movement
-Make Object Invisible
-
-INTERNAL VARIABLES (Runtime):
------------------------------
-__smoothMov            -> fator de suavização
-__smoothVelocity       -> velocidade suavizada
-__lastPosition         -> posição anterior
-__lastDirection        -> última direção válida
-__smoothSlidingFlag    -> usado para evitar sliding
-__jumpDirection        -> direção salva no pulo
-__jumpRotation         -> rotação salva no pulo
-__jumpTimer            -> tempo desde início do pulo
-__minJumpTime          -> tempo mínimo em estado jump
-__jumpMoving           -> indica se pulou em movimento
-====================================================
 """
 
 from mathutils import Vector, Matrix
+from math import pi
 from Range import logic, types, constraints, events
 from collections import OrderedDict
-
 
 def clamp(x, a, b):
     return min(max(a, x), b)
@@ -82,27 +37,22 @@ class CharacterController(types.KX_PythonComponent):
         self.staticJump = args["Static Jump Direction"]
         self.staticJumpRot = args["Static Jump Rotation"]
 
-        # ---- Movement smoothing ----
         self.__smoothMov = clamp(args["Smooth Character Movement"], 0, 0.99)
         self.__smoothVelocity = Vector((0, 0, 0))
         self.__lastPosition = self.object.worldPosition.copy()
         self.__lastDirection = Vector((0, 0, 0))
         self.__smoothSlidingFlag = False
 
-        # ---- Jump lock ----
         self.__jumpDirection = Vector((0, 0, 0))
         self.__jumpRotation = Matrix.Identity(3)
 
-        # ---- Jump state ----
         self.__jumpTimer = 0.0
         self.__minJumpTime = 0.15
         self.__jumpMoving = False
 
-        # ---- Physics character ----
         self.character = constraints.getCharacter(self.object)
         self.character.maxJumps = args["Max Jumps"]
 
-        # ---- Public object variables ----
         self.object["state"] = "idle"
         self.object["speed"] = 0.0
 
@@ -111,12 +61,12 @@ class CharacterController(types.KX_PythonComponent):
 
     # ---------------------- Movement ----------------------
     def characterMovement(self):
+
         dt = logic.deltaTime()
         keyboard = logic.keyboard.inputs
 
         running = keyboard[events.LEFTSHIFTKEY].active
         max_speed = self.runSpeed if running else self.walkSpeed
-        speed = max_speed
 
         ix = keyboard[events.DKEY].active - keyboard[events.AKEY].active
         iy = keyboard[events.WKEY].active - keyboard[events.SKEY].active
@@ -124,40 +74,43 @@ class CharacterController(types.KX_PythonComponent):
         input_vec = Vector((ix, iy, 0))
         self.__smoothSlidingFlag = input_vec.length != 0
 
+        # ---- Normalize diagonal ----
         if input_vec.length:
             input_vec.normalize()
-            input_vec *= speed * dt
+            input_vec *= max_speed * dt
         else:
             input_vec.zero()
 
-        # ---- Jump locking ----
+        # ---- Jump lock (apenas direção, não rotação) ----
         if not self.character.onGround:
             if self.staticJump:
                 input_vec = self.__jumpDirection.copy()
-            if self.staticJumpRot:
-                self.object.worldOrientation = self.__jumpRotation.copy()
         else:
             self.__jumpDirection = input_vec.copy()
-            self.__jumpRotation = self.object.worldOrientation.copy()
 
         # ---- Smooth movement ----
         smooth_factor = 1.0 - self.__smoothMov
         self.__smoothVelocity = self.__smoothVelocity.lerp(input_vec, smooth_factor)
+
+        # Movimento SEM alterar rotação
         self.character.walkDirection = (
             self.object.worldOrientation * self.__smoothVelocity
         )
 
-        # ---- Speed (normalized) ----
+        # ---- Speed normalized ----
         current_speed = self.__smoothVelocity.length / max(dt, 0.0001)
         self.object["speed"] = clamp(current_speed / self.runSpeed, 0.0, 1.0)
 
         # ---- Track movement ----
         if self.__smoothVelocity.length:
-            self.__lastDirection = self.object.worldPosition - self.__lastPosition
+            self.__lastDirection = (
+                self.object.worldPosition - self.__lastPosition
+            )
             self.__lastPosition = self.object.worldPosition.copy()
 
-        # ---- Ground locomotion states ----
+        # ---------------- GROUND STATES ----------------
         if self.character.onGround:
+
             self.__jumpTimer = 0.0
 
             if ix == 0 and iy == 0:
@@ -166,7 +119,15 @@ class CharacterController(types.KX_PythonComponent):
 
             prefix = "running_" if running else "walking_"
 
-            if iy > 0:
+            if iy > 0 and ix > 0:
+                self.object["state"] = prefix + "front_right"
+            elif iy > 0 and ix < 0:
+                self.object["state"] = prefix + "front_left"
+            elif iy < 0 and ix > 0:
+                self.object["state"] = prefix + "back_right"
+            elif iy < 0 and ix < 0:
+                self.object["state"] = prefix + "back_left"
+            elif iy > 0:
                 self.object["state"] = prefix + "front"
             elif iy < 0:
                 self.object["state"] = prefix + "back"
@@ -178,6 +139,7 @@ class CharacterController(types.KX_PythonComponent):
     # ---------------------- Jump ----------------------
     def characterJump(self):
         keyboard = logic.keyboard.inputs
+
         if logic.KX_INPUT_JUST_ACTIVATED in keyboard[events.SPACEKEY].queue:
             self.__jumpMoving = self.__smoothVelocity.length > 0.01
             self.character.jump()
@@ -186,7 +148,9 @@ class CharacterController(types.KX_PythonComponent):
 
     # ---------------------- Air State ----------------------
     def updateAirState(self):
+
         if not self.character.onGround:
+
             dt = logic.deltaTime()
             self.__jumpTimer += dt
 
@@ -203,8 +167,11 @@ class CharacterController(types.KX_PythonComponent):
 
     # ---------------------- Avoid sliding ----------------------
     def avoidSlide(self):
+
         if not self.__smoothSlidingFlag and self.__smoothVelocity.length > 0:
+
             target = self.__lastPosition.copy()
+
             self.object.worldPosition.xy = self.object.worldPosition.xy.lerp(
                 target.xy, 0.5
             )
@@ -215,6 +182,7 @@ class CharacterController(types.KX_PythonComponent):
 
     # ---------------------- Update ----------------------
     def update(self):
+
         if not self.active:
             return
 
