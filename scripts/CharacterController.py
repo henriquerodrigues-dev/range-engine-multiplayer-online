@@ -1,194 +1,233 @@
-"""
-====================================================
-CharacterController – Locomotion & Animation States
-====================================================
-"""
+"""CharacterController - locomocao, salto e publicacao do estado consumido pelos outros componentes."""
 
-from mathutils import Vector, Matrix
-from math import pi
-from Range import logic, types, constraints, events
 from collections import OrderedDict
+from math import atan2, pi
 
-def clamp(x, a, b):
-    return min(max(a, x), b)
+from mathutils import Matrix, Vector
+from Range import constraints, events, logic, types
+
+
+TWO_PI = pi * 2.0
+
+
+def clamp(value, low, high):
+    return min(max(value, low), high)
+
+
+def shortestArc(current, goal):
+    return (goal - current + pi) % TWO_PI - pi
 
 
 class CharacterController(types.KX_PythonComponent):
 
-    # ---------------------- Configurable arguments ----------------------
     args = OrderedDict([
         ("Activate", True),
         ("Walk Speed", 2.5),
         ("Run Speed", 5.0),
-        ("Max Jumps", 1),
-        ("Avoid Sliding", True),
-        ("Static Jump Direction", False),
-        ("Static Jump Rotation", False),
+        ("Facing Mode", {"Rotate To Movement", "Hybrid (Back Steps)", "Align To View"}),
+        ("Turn Smooth", 0.25),
         ("Smooth Character Movement", 0.1),
+        ("Avoid Sliding", True),
+        ("Air Control", 0.35),
+        ("Static Jump Direction", False),
+        ("Max Jumps", 1),
+        ("Allow Idle Jump", True),
+        ("Jump Buffer Time", 0.15),
+        ("Coyote Time", 0.12),
+        ("Min Jump Time", 0.15),
         ("Make Object Invisible", False),
     ])
 
-    # ---------------------- Start ----------------------
+    REFERENCE_FPS = 60.0
+    STOP_THRESHOLD = 0.0025
+    RISING_THRESHOLD = 0.05
+
+    FACE_VIEW = 0
+    FACE_ROTATE = 1
+    FACE_HYBRID = 2
+
+    FACING_MODES = {
+        "Align To View": FACE_VIEW,
+        "Rotate To Movement": FACE_ROTATE,
+        "Hybrid (Back Steps)": FACE_HYBRID,
+    }
+
+    DIRECTIONS = {
+        (0, 1): "front",
+        (0, -1): "back",
+        (1, 0): "strafe_right",
+        (-1, 0): "strafe_left",
+        (1, 1): "front_right",
+        (-1, 1): "front_left",
+        (1, -1): "back_right",
+        (-1, -1): "back_left",
+    }
+
     def start(self, args):
         self.active = args["Activate"]
-        self.walkSpeed = args["Walk Speed"]
-        self.runSpeed = args["Run Speed"]
-        self.avoidSliding = args["Avoid Sliding"]
-        self.staticJump = args["Static Jump Direction"]
-        self.staticJumpRot = args["Static Jump Rotation"]
+        self.walk_speed = max(float(args["Walk Speed"]), 0.001)
+        self.run_speed = max(float(args["Run Speed"]), self.walk_speed)
+        self.facing = self.FACING_MODES.get(args["Facing Mode"], self.FACE_ROTATE)
+        self.turn_smooth = clamp(float(args["Turn Smooth"]), 0.01, 1.0)
+        self.move_smooth = 1.0 - clamp(float(args["Smooth Character Movement"]), 0.0, 0.99)
+        self.avoid_sliding = args["Avoid Sliding"]
+        self.air_control = clamp(float(args["Air Control"]), 0.0, 1.0)
+        self.static_jump_direction = args["Static Jump Direction"]
+        self.allow_idle_jump = args["Allow Idle Jump"]
+        self.jump_buffer_time = max(float(args["Jump Buffer Time"]), 0.0)
+        self.coyote_time = max(float(args["Coyote Time"]), 0.0)
+        self.min_jump_time = max(float(args["Min Jump Time"]), 0.0)
 
-        self.__smoothMov = clamp(args["Smooth Character Movement"], 0, 0.99)
-        self.__smoothVelocity = Vector((0, 0, 0))
-        self.__lastPosition = self.object.worldPosition.copy()
-        self.__lastDirection = Vector((0, 0, 0))
-        self.__smoothSlidingFlag = False
-
-        self.__jumpDirection = Vector((0, 0, 0))
-        self.__jumpRotation = Matrix.Identity(3)
-
-        self.__jumpTimer = 0.0
-        self.__minJumpTime = 0.15
-        self.__jumpMoving = False
+        self.velocity = Vector((0.0, 0.0, 0.0))
+        self.jump_velocity = Vector((0.0, 0.0, 0.0))
+        self.jump_buffer = 0.0
+        self.coyote = 0.0
+        self.air_time = 0.0
+        self.air_moving = False
+        self.body_yaw = self.object.worldOrientation.to_euler()[2]
 
         self.character = constraints.getCharacter(self.object)
-        self.character.maxJumps = args["Max Jumps"]
+        if self.character is None:
+            self.active = False
+            print("[CharacterController] '%s' nao possui fisica do tipo Character." % self.object.name)
+            return
 
-        self.object["state"] = "idle"
-        self.object["speed"] = 0.0
+        self.character.maxJumps = max(int(args["Max Jumps"]), 1)
 
         if self.active and args["Make Object Invisible"]:
             self.object.visible = False
 
-    # ---------------------- Movement ----------------------
-    def characterMovement(self):
+        self.publish("idle", self.walk_speed, 0, 0, False, True)
 
-        dt = logic.deltaTime()
+    def readInput(self):
         keyboard = logic.keyboard.inputs
+        return (int(keyboard[events.DKEY].active - keyboard[events.AKEY].active),
+                int(keyboard[events.WKEY].active - keyboard[events.SKEY].active),
+                bool(keyboard[events.LEFTSHIFTKEY].active),
+                logic.KX_INPUT_JUST_ACTIVATED in keyboard[events.SPACEKEY].queue)
 
-        running = keyboard[events.LEFTSHIFTKEY].active
-        max_speed = self.runSpeed if running else self.walkSpeed
+    def smoothFactor(self, amount, dt):
+        return clamp(1.0 - pow(1.0 - amount, dt * self.REFERENCE_FPS), 0.0, 1.0)
 
-        ix = keyboard[events.DKEY].active - keyboard[events.AKEY].active
-        iy = keyboard[events.WKEY].active - keyboard[events.SKEY].active
+    def movementFrame(self):
+        if self.facing == self.FACE_VIEW:
+            return self.object.worldOrientation
+        yaw = self.object.get("view_yaw")
+        return Matrix.Identity(3) if yaw is None else Matrix.Rotation(float(yaw), 3, "Z")
 
-        input_vec = Vector((ix, iy, 0))
-        self.__smoothSlidingFlag = input_vec.length != 0
+    def groundDirection(self, x, y):
+        if not (x or y):
+            return None, False
+        if self.facing == self.FACE_VIEW:
+            return self.DIRECTIONS[(x, y)], False
+        if self.facing == self.FACE_HYBRID and y <= -abs(x):
+            return "back", True
+        return "front", False
 
-        # ---- Normalize diagonal ----
-        if input_vec.length:
-            input_vec.normalize()
-            input_vec *= max_speed * dt
+    def move(self, dt, grounded, x, y, target_speed):
+        local = Vector((x, y, 0.0))
+        if local.length_squared > 1.0:
+            local.normalize()
+
+        desired = self.movementFrame() * local * target_speed
+
+        if grounded:
+            self.jump_velocity = self.velocity.copy()
+            factor = self.smoothFactor(self.move_smooth, dt)
+        elif self.static_jump_direction:
+            desired = self.jump_velocity.copy()
+            factor = 1.0
         else:
-            input_vec.zero()
+            factor = self.smoothFactor(self.move_smooth, dt) * self.air_control
 
-        # ---- Jump lock (apenas direção, não rotação) ----
-        if not self.character.onGround:
-            if self.staticJump:
-                input_vec = self.__jumpDirection.copy()
-        else:
-            self.__jumpDirection = input_vec.copy()
+        self.velocity = self.velocity.lerp(desired, factor)
 
-        # ---- Smooth movement ----
-        smooth_factor = 1.0 - self.__smoothMov
-        self.__smoothVelocity = self.__smoothVelocity.lerp(input_vec, smooth_factor)
+        if self.avoid_sliding and not local.length_squared:
+            if self.velocity.length_squared < self.STOP_THRESHOLD:
+                self.velocity.zero()
 
-        # Movimento SEM alterar rotação
-        self.character.walkDirection = (
-            self.object.worldOrientation * self.__smoothVelocity
-        )
+        self.character.walkDirection = self.velocity * dt
+        return desired
 
-        # ---- Speed normalized ----
-        current_speed = self.__smoothVelocity.length / max(dt, 0.0001)
-        self.object["speed"] = clamp(current_speed / self.runSpeed, 0.0, 1.0)
+    def updateFacing(self, dt, desired, backwards):
+        if self.facing == self.FACE_VIEW or not desired.length_squared:
+            return
 
-        # ---- Track movement ----
-        if self.__smoothVelocity.length:
-            self.__lastDirection = (
-                self.object.worldPosition - self.__lastPosition
-            )
-            self.__lastPosition = self.object.worldPosition.copy()
+        target = -desired if backwards else desired
+        arc = shortestArc(self.body_yaw, atan2(-target.x, target.y))
 
-        # ---------------- GROUND STATES ----------------
-        if self.character.onGround:
+        self.body_yaw += arc * self.smoothFactor(self.turn_smooth, dt)
+        self.object.worldOrientation = Matrix.Rotation(self.body_yaw, 3, "Z")
 
-            self.__jumpTimer = 0.0
+    def updateJump(self, dt, grounded, pressed):
+        self.coyote = self.coyote_time if grounded else max(0.0, self.coyote - dt)
+        self.jump_buffer = self.jump_buffer_time if pressed else max(0.0, self.jump_buffer - dt)
 
-            if ix == 0 and iy == 0:
-                self.object["state"] = "idle"
-                return
+        if not self.jump_buffer:
+            return False
 
-            prefix = "running_" if running else "walking_"
+        if not self.allow_idle_jump and self.velocity.length_squared <= self.STOP_THRESHOLD:
+            self.jump_buffer = 0.0
+            return False
 
-            if iy > 0 and ix > 0:
-                self.object["state"] = prefix + "front_right"
-            elif iy > 0 and ix < 0:
-                self.object["state"] = prefix + "front_left"
-            elif iy < 0 and ix > 0:
-                self.object["state"] = prefix + "back_right"
-            elif iy < 0 and ix < 0:
-                self.object["state"] = prefix + "back_left"
-            elif iy > 0:
-                self.object["state"] = prefix + "front"
-            elif iy < 0:
-                self.object["state"] = prefix + "back"
-            elif ix > 0:
-                self.object["state"] = prefix + "strafe_right"
-            elif ix < 0:
-                self.object["state"] = prefix + "strafe_left"
+        if not (grounded or self.coyote or 0 < self.character.jumpCount < self.character.maxJumps):
+            return False
 
-    # ---------------------- Jump ----------------------
-    def characterJump(self):
-        keyboard = logic.keyboard.inputs
+        self.character.jump()
+        self.jump_buffer = 0.0
+        self.coyote = 0.0
+        self.air_time = 0.0
+        self.air_moving = self.velocity.length_squared > self.STOP_THRESHOLD
+        return True
 
-        if logic.KX_INPUT_JUST_ACTIVATED in keyboard[events.SPACEKEY].queue:
-            self.__jumpMoving = self.__smoothVelocity.length > 0.01
-            self.character.jump()
-            self.object["state"] = "jump_move" if self.__jumpMoving else "jump_idle"
-            self.__jumpTimer = 0.0
+    def resolveState(self, dt, grounded, direction, run):
+        moving = self.velocity.length_squared > self.STOP_THRESHOLD
 
-    # ---------------------- Air State ----------------------
-    def updateAirState(self):
+        if grounded:
+            self.air_time = 0.0
+            self.air_moving = moving
+            if direction is None:
+                return "idle"
+            return ("running_" if run else "walking_") + direction
 
-        if not self.character.onGround:
+        self.air_time += dt
+        self.air_moving = self.air_moving or moving
 
-            dt = logic.deltaTime()
-            self.__jumpTimer += dt
+        rising = (self.air_time < self.min_jump_time or
+                  self.object.getLinearVelocity().z > self.RISING_THRESHOLD)
 
-            vel_z = self.object.getLinearVelocity().z
-            moving = self.__jumpMoving or self.__smoothVelocity.length > 0.01
+        return ("jump" if rising else "fall") + ("_move" if self.air_moving else "_idle")
 
-            if self.__jumpTimer < self.__minJumpTime:
-                self.object["state"] = "jump_move" if moving else "jump_idle"
-            else:
-                if vel_z > 0.05:
-                    self.object["state"] = "jump_move" if moving else "jump_idle"
-                else:
-                    self.object["state"] = "fall_move" if moving else "fall_idle"
+    def publish(self, state, target_speed, x, y, run, grounded):
+        speed = self.velocity.length
+        self.object["state"] = state
+        self.object["velocity"] = speed
+        self.object["speed"] = clamp(speed / target_speed, 0.0, 1.0)
+        self.object["grounded"] = grounded
+        self.object["moving"] = speed * speed > self.STOP_THRESHOLD
+        self.object["running"] = run
+        self.object["jump_count"] = self.character.jumpCount
+        self.object["move_x"] = x
+        self.object["move_y"] = y
+        self.object["auto_facing"] = self.facing != self.FACE_VIEW
 
-    # ---------------------- Avoid sliding ----------------------
-    def avoidSlide(self):
-
-        if not self.__smoothSlidingFlag and self.__smoothVelocity.length > 0:
-
-            target = self.__lastPosition.copy()
-
-            self.object.worldPosition.xy = self.object.worldPosition.xy.lerp(
-                target.xy, 0.5
-            )
-
-            if self.__lastDirection.length > 0:
-                if self.__lastDirection.angle(self.__smoothVelocity) > 0.5:
-                    self.__smoothVelocity.zero()
-
-    # ---------------------- Update ----------------------
     def update(self):
-
         if not self.active:
             return
 
-        self.characterMovement()
-        self.characterJump()
-        self.updateAirState()
+        dt = logic.deltaTime()
+        grounded = self.character.onGround
+        x, y, run, pressed = self.readInput()
 
-        if self.avoidSliding:
-            self.avoidSlide()
+        direction, backwards = self.groundDirection(x, y)
+        target_speed = self.run_speed if run else self.walk_speed
+        jumped = self.updateJump(dt, grounded, pressed)
+
+        self.updateFacing(dt, self.move(dt, grounded, x, y, target_speed), backwards)
+
+        if jumped:
+            state = "jump_move" if self.air_moving else "jump_idle"
+        else:
+            state = self.resolveState(dt, grounded, direction, run)
+
+        self.publish(state, target_speed, x, y, run, grounded)

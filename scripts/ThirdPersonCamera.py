@@ -1,168 +1,223 @@
-from Range import logic, types, render
+"""ThirdPersonCamera - camera orbital com mouselook, colisao, zoom e alinhamento do jogador."""
+
 from collections import OrderedDict
-from mathutils import Vector, Matrix
+from math import pi
+
+from mathutils import Matrix, Vector
+from Range import events, logic, render, types
+
+
+TWO_PI = pi * 2.0
+
+
+def clamp(value, low, high):
+    return min(max(value, low), high)
+
+
+def shortestArc(current, goal):
+    return (goal - current + pi) % TWO_PI - pi
+
 
 class ThirdPersonCamera(types.KX_PythonComponent):
-    # ---------------------- Configurable arguments ----------------------
+
     args = OrderedDict([
-        ("Activate", True),                     # Activate the camera
-        ("Mouse Sensibility", 2.0),             # Mouse sensitivity
-        ("Invert Mouse X Axis", False),         # Invert X axis
-        ("Invert Mouse Y Axis", False),         # Invert Y axis
-        ("Camera Height", 1.5),                 # Camera height above player
-        ("Camera Distance", 5.0),               # Distance from player
-        ("Camera Crab (Side)", 0.6),            # Lateral offset
-        ("Camera Collision", True),             # Enable collision detection
-        ("Camera Collision Property", "ground"),# Collision property
-        ("Align Player to View", {"Never", "On Player Movement", "Always"}), # Player alignment mode
-        ("Align Player Smooth", 0.7),           # Player rotation smoothing
-        ("Rotation Smooth", 0.05),              # Camera rotation smoothing
-        ("Position Smooth", 0.3),               # Camera position smoothing
+        ("Activate", True),
+        ("Mouse Sensibility", 2.0),
+        ("Invert Mouse X Axis", False),
+        ("Invert Mouse Y Axis", False),
+        ("Camera Height", 1.5),
+        ("Camera Distance", 5.0),
+        ("Camera Crab (Side)", 0.6),
+        ("Zoom With Wheel", True),
+        ("Zoom Step", 0.5),
+        ("Zoom Smooth", 0.15),
+        ("Min Camera Distance", 1.0),
+        ("Max Camera Distance", 8.0),
+        ("Min Tilt", -1.2),
+        ("Max Tilt", 1.3),
+        ("Camera Collision", True),
+        ("Camera Collision Property", "ground"),
+        ("Camera Collision Margin", 0.25),
+        ("Align Player to View", {"Never", "On Player Movement", "Always"}),
+        ("Align Player Smooth", 0.7),
+        ("Rotation Smooth", 0.05),
+        ("Position Smooth", 0.3),
     ])
 
+    REFERENCE_FPS = 60.0
+    MOVE_THRESHOLD = 0.000001
+    ZOOM_EPSILON = 0.0001
+
+    ALIGN_NEVER = 0
+    ALIGN_ON_MOVEMENT = 1
+    ALIGN_ALWAYS = 2
+
+    ALIGN_MODES = {
+        "Never": ALIGN_NEVER,
+        "On Player Movement": ALIGN_ON_MOVEMENT,
+        "Always": ALIGN_ALWAYS,
+    }
+
     def start(self, args):
-        """Initialize camera settings"""
         self.active = args["Activate"]
-        self.mouse_sens = args["Mouse Sensibility"] * -0.001
-        self.invert_x = -1 if args["Invert Mouse X Axis"] else 1
-        self.invert_y = -1 if args["Invert Mouse Y Axis"] else 1
+        self.player = self.object.parent
 
-        self.camera_pos = Vector([0, 0, 0])
-        self.set_camera_pos(args["Camera Crab (Side)"], -args["Camera Distance"], args["Camera Height"])
+        if self.player is None:
+            self.active = False
+            print("[ThirdPersonCamera] a camera precisa estar parenteada ao jogador.")
+            return
 
-        self.camera_collision = args["Camera Collision"]
-        self.camera_collision_prop = args["Camera Collision Property"]
+        self.sensibility = float(args["Mouse Sensibility"]) * -0.001
+        self.invert_x = -1.0 if args["Invert Mouse X Axis"] else 1.0
+        self.invert_y = -1.0 if args["Invert Mouse Y Axis"] else 1.0
 
-        self.cam_align = []
-        self.set_camera_align(args["Align Player to View"])
-        self.cam_align_smooth = args["Align Player Smooth"]
+        self.height = float(args["Camera Height"])
+        self.crab = float(args["Camera Crab (Side)"])
+        self.min_distance = max(float(args["Min Camera Distance"]), 0.0)
+        self.max_distance = max(float(args["Max Camera Distance"]), self.min_distance)
+        self.zoom_enabled = args["Zoom With Wheel"]
+        self.zoom_step = float(args["Zoom Step"])
+        self.zoom_smooth = clamp(float(args["Zoom Smooth"]), 0.01, 1.0)
 
-        self.rotation_smooth = args["Rotation Smooth"]
-        self.position_smooth = args["Position Smooth"]
+        self.target_distance = clamp(float(args["Camera Distance"]),
+                                     self.min_distance, self.max_distance)
+        self.distance = self.target_distance
 
-        self.current_pan = 0.0
-        self.current_tilt = 0.0
-        self.smoothed_pos = self.object.worldPosition.copy()
+        self.min_tilt = float(args["Min Tilt"])
+        self.max_tilt = max(float(args["Max Tilt"]), self.min_tilt)
 
-        # Error if camera has no parent
-        self.error = self.object.parent is None
-        if self.error:
-            print("[Third Person Camera] Error: The camera must be parented to an object.")
+        self.collision = args["Camera Collision"]
+        self.collision_prop = args["Camera Collision Property"]
+        self.collision_margin = max(float(args["Camera Collision Margin"]), 0.0)
 
-        self.camera_pan = Matrix.Identity(3)
-        self.camera_tilt = Matrix.Identity(3)
+        align = args["Align Player to View"]
+        self.align_mode = self.ALIGN_MODES.get(align, self.ALIGN_NEVER) if isinstance(align, str) else self.ALIGN_NEVER
+        self.align_smooth = 1.0 - clamp(float(args["Align Player Smooth"]), 0.0, 0.99)
+        self.rotation_smooth = clamp(float(args["Rotation Smooth"]), 0.01, 1.0)
+        self.position_smooth = clamp(float(args["Position Smooth"]), 0.01, 1.0)
 
-        w, h = render.getWindowWidth(), render.getWindowHeight()
-        self.prev_mouse_pos = Vector([w/2, h/2])
-        render.setMousePosition(int(self.prev_mouse_pos[0]), int(self.prev_mouse_pos[1]))
+        self.yaw = self.player.worldOrientation.to_euler()[2]
+        self.tilt = 0.0
+        self.mouse_delta = Vector((0.0, 0.0))
+        self.centered = False
 
-        self.player_pos = None
-        if not self.error:
-            self.player_pos = self.object.parent.worldPosition.copy()
+        self.player_position = self.player.worldPosition.copy()
+        self.refreshRotation()
+        self.camera_position = self.desiredPosition(self.pivot())
+        self.object.worldPosition = self.camera_position
+        self.object.worldOrientation = self.orientation
+        self.player["view_yaw"] = self.yaw
 
-    # ---------------------- Camera rotation ----------------------
-    def pan(self, angle):
-        """Smooth horizontal rotation"""
-        self.current_pan += (angle - self.current_pan) * self.rotation_smooth
-        euler = self.camera_pan.to_euler()
-        euler[2] += self.current_pan
-        self.camera_pan = euler.to_matrix()
+    def smoothFactor(self, amount, dt):
+        return clamp(1.0 - pow(1.0 - amount, dt * self.REFERENCE_FPS), 0.0, 1.0)
 
-    def tilt(self, angle):
-        """Smooth vertical rotation"""
-        self.current_tilt += (angle - self.current_tilt) * self.rotation_smooth
-        euler = self.camera_tilt.to_euler()
-        euler[0] += self.current_tilt
-        self.camera_tilt = euler.to_matrix()
+    def refreshRotation(self):
+        self.pan = Matrix.Rotation(self.yaw, 3, "Z")
+        self.boom = self.pan * Matrix.Rotation(self.tilt, 3, "X")
+        self.orientation = self.pan * Matrix.Rotation(self.tilt + pi * 0.5, 3, "X")
 
-    # ---------------------- Camera position ----------------------
-    def get_world_camera_pos(self):
-        """Compute world position based on tilt, pan, and offset"""
-        pos = self.camera_pos.copy()
-        pos = self.camera_tilt * pos
-        pos = self.camera_pan * pos
-        return self.object.parent.worldPosition + pos
+    def pivot(self):
+        return self.player.worldPosition + Vector((0.0, 0.0, self.height))
 
-    def limit_camera_rotation(self):
-        """Prevent vertical flip"""
-        euler = self.camera_tilt.to_euler()
-        euler[0] = max(min(euler[0], 1.4), -1.4)
-        self.camera_tilt = euler.to_matrix()
+    def desiredPosition(self, pivot):
+        return pivot + self.boom * Vector((self.crab, -self.distance, 0.0))
 
-    def is_player_moving(self):
-        """Check if player moved since last frame"""
-        if self.player_pos is None:
-            return False
-        delta = self.player_pos - self.object.parent.worldPosition.copy()
-        moving = delta.length > 0.001
-        self.player_pos = self.object.parent.worldPosition.copy()
-        return moving
+    def mouselook(self, dt):
+        width = render.getWindowWidth()
+        height = render.getWindowHeight()
+        center_x = int(width * 0.5)
+        center_y = int(height * 0.5)
 
-    def apply_camera_position(self):
-        """Set camera position, apply collision and smoothing"""
-        cam_pos = self.get_world_camera_pos()
+        position = logic.mouse.position
+        render.setMousePosition(center_x, center_y)
 
-        if self.camera_collision:
-            target = self.object.parent.worldPosition + Vector([0, 0, self.camera_pos[2] * 0.5])
-            hit, hit_pos, _ = self.object.rayCast(target, cam_pos, 0, self.camera_collision_prop, 1, 0, 0)
-            if hit:
-                cam_pos = hit_pos
+        if not self.centered:
+            self.centered = True
+            return
 
-        # Smooth position
-        self.smoothed_pos = self.smoothed_pos.lerp(cam_pos, self.position_smooth)
-        self.object.worldPosition = self.smoothed_pos
+        raw = Vector(((int(position[0] * width) - center_x) * self.sensibility * self.invert_x,
+                      (int(position[1] * height) - center_y) * self.sensibility * self.invert_y))
 
-        # Camera orientation
-        view_dir = self.camera_tilt * Vector([0, 1, 0])
-        view_dir = self.camera_pan * view_dir
-        self.object.lookAt([0, 0, 1], 1, 1)
-        self.object.lookAt(view_dir * -1, 2, 1)
+        self.mouse_delta = self.mouse_delta.lerp(raw, self.smoothFactor(self.rotation_smooth, dt))
+        self.yaw += self.mouse_delta.x
+        self.tilt = clamp(self.tilt + self.mouse_delta.y, self.min_tilt, self.max_tilt)
 
-    # ---------------------- Helper functions ----------------------
-    def set_camera_align(self, align_type):
-        self.cam_align = {
-            "Never": [0, 0],
-            "On Player Movement": [0, 1],
-            "Always": [1, 1]
-        }[align_type]
+    def updateZoom(self, dt):
+        if self.zoom_enabled:
+            mouse = logic.mouse.inputs
+            step = 0.0
 
-    def set_camera_pos(self, x, y, z):
-        self.camera_pos = Vector([x, y, z])
+            if logic.KX_INPUT_JUST_ACTIVATED in mouse[events.WHEELUPMOUSE].queue:
+                step -= self.zoom_step
+            if logic.KX_INPUT_JUST_ACTIVATED in mouse[events.WHEELDOWNMOUSE].queue:
+                step += self.zoom_step
 
-    def mouselook(self):
-        """Rotate camera based on mouse input"""
-        wSize = Vector([render.getWindowWidth(), render.getWindowHeight()])
-        wCenter = Vector([int(wSize[0] * 0.5), int(wSize[1] * 0.5)])
+            if step:
+                self.target_distance = clamp(self.target_distance + step,
+                                             self.min_distance, self.max_distance)
 
-        mPos = Vector(logic.mouse.position)
-        mPos[0] = int(mPos[0] * wSize[0])
-        mPos[1] = int(mPos[1] * wSize[1])
+        gap = self.target_distance - self.distance
+        if abs(gap) > self.ZOOM_EPSILON:
+            self.distance += gap * self.smoothFactor(self.zoom_smooth, dt)
+        else:
+            self.distance = self.target_distance
 
-        render.setMousePosition(int(wCenter[0]), int(wCenter[1]))
+    def isPlayerMoving(self):
+        moving = self.player.get("moving")
+        if moving is not None:
+            return moving
 
-        mDisp = (mPos - wCenter) * self.mouse_sens
-        mDisp[0] *= self.invert_x
-        mDisp[1] *= self.invert_y
-        
-        self.pan(mDisp[0])
-        self.tilt(mDisp[1])
-        self.limit_camera_rotation()
+        delta = self.player.worldPosition - self.player_position
+        self.player_position = self.player.worldPosition.copy()
+        return delta.length_squared > self.MOVE_THRESHOLD
 
-    def align_player_to_view(self):
-        """Align player smoothly to camera view"""
-        target_dir = self.get_camera_view()
-        self.object.parent.lookAt(target_dir, 1, 1.0 - self.cam_align_smooth)
-        self.object.parent.lookAt([0, 0, 1], 2, 1)
+    def alignPlayer(self, dt):
+        if self.align_mode == self.ALIGN_NEVER or self.player.get("auto_facing"):
+            return
+        if self.align_mode == self.ALIGN_ON_MOVEMENT and not self.isPlayerMoving():
+            return
 
-    def get_camera_view(self):
-        """Return forward direction of camera in world space"""
-        return self.camera_pan * Vector([0, 1, 0])
+        current = self.player.worldOrientation.to_euler()[2]
+        step = shortestArc(current, self.yaw) * self.smoothFactor(self.align_smooth, dt)
+        self.player.worldOrientation = Matrix.Rotation(current + step, 3, "Z")
+
+    def resolveCollision(self, origin, target):
+        offset = target - origin
+        length = offset.length
+        if not length:
+            return target, False
+
+        hit, point, normal = self.object.rayCast(target, origin, 0.0,
+                                                 self.collision_prop, False, True)
+        if hit is None:
+            return target, False
+
+        free = max((Vector(point) - origin).length - self.collision_margin, 0.0)
+        return origin + offset * (free / length), True
+
+    def updateTransform(self, dt):
+        origin = self.pivot()
+        target = self.desiredPosition(origin)
+        blocked = False
+
+        if self.collision:
+            target, blocked = self.resolveCollision(origin, target)
+
+        factor = 1.0 if blocked else self.smoothFactor(self.position_smooth, dt)
+        self.camera_position = self.camera_position.lerp(target, factor)
+
+        self.object.worldPosition = self.camera_position
+        self.object.worldOrientation = self.orientation
 
     def update(self):
-        """Update camera every frame"""
-        if not self.active or self.error:
+        if not self.active:
             return
-        self.mouselook()
-        if self.cam_align[self.is_player_moving()]:
-            self.align_player_to_view()
-        self.apply_camera_position()
+
+        dt = logic.deltaTime()
+        self.mouselook(dt)
+        self.updateZoom(dt)
+        self.refreshRotation()
+
+        self.player["view_yaw"] = self.yaw
+        self.alignPlayer(dt)
+        self.updateTransform(dt)
